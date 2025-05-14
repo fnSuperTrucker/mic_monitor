@@ -1,333 +1,213 @@
 import tkinter as tk
+from tkinter import ttk
 import sounddevice as sd
 import numpy as np
-import time
-import platform
-from tkinter import ttk
+import logging
+import queue
 
-# --- Audio Settings ---
-samplerate = 44100
-blocksize = 4096
-channels = 1
-audio_threshold = 0.005
-CHECK_DEVICE_INTERVAL_MS = 2000
-RETRY_INTERVAL_MS = 2000
-STREAM_TIMEOUT_S = 5
-DEVICE_REFRESH_DELAY = 0.5
-MAX_RETRY_BACKOFF_MS = 5000
-MAX_RETRIES = 5
-VOLUME_SCALE = 100
-DEBUG_VERBOSE = False  # Set to True for detailed audio logging
+# Logging setup
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- VU Meter Settings ---
-vu_width = 200
-vu_height = 20
-peak_color = "red"
-activity_color = "green"
-decay_rate = 0.98
-peak_hold_time = 0.5
-
-# --- Status Indicator Settings ---
-status_width = 80
-status_height = 20
-no_input_color = "gray"
-has_input_color = "yellow"
-
-last_volume_norm = 0.0
-update_threshold = 0.01
-last_callback_time = time.time()
-is_restarting = False
-last_device_list = None
-last_status_text = None
-retry_count = 0
-last_volume_log_time = 0
-
+# Global variables
+selected_device_id = None
+available_devices = []
 stream = None
-current_input_device = None
-root = None
-vu_meter = None
-input_status_indicator = None
-target_device_name = "Microphone (USB Audio Device)"
-target_device_indices = [1, 4, 6, 13]
+volume_queue = queue.Queue()
 
+# VU Meter class
 class VUMeter(tk.Canvas):
     def __init__(self, master, width, height, **kwargs):
-        tk.Canvas.__init__(self, master, width=width, height=height, **kwargs)
+        super().__init__(master, width=width, height=height, **kwargs)
         self.width = width
         self.height = height
-        self.level = 0
-        self.peak = 0
-        self.peak_hold_start = 0
-        self.activity_bar = self.create_rectangle(0, 0, 0, height, fill=activity_color)
-        self.peak_indicator = self.create_line(0, 0, 0, height, fill=peak_color, width=2)
+        self.bar = self.create_rectangle(0, 0, 0, height, fill="green")
 
     def set_level(self, level):
-        self.level = max(0, min(1, level))
-        if self.level > self.peak:
-            self.peak = self.level
-            self.peak_hold_start = time.time()
+        self.coords(self.bar, 0, 0, self.width * max(0, min(1, level)), self.height)
 
-    def update_vu(self):
-        activity_width = int(self.width * self.level)
-        self.coords(self.activity_bar, 0, 0, activity_width, self.height)
+# Audio callback function
+def audio_callback(indata, frames, time, status):
+    if status:
+        logging.warning(f"Stream status: {status}")
+    volume_norm = np.linalg.norm(indata) * 10
+    volume_queue.put(volume_norm / 10)
 
-        if time.time() - self.peak_hold_start < peak_hold_time:
-            peak_x = int(self.width * self.peak)
-            self.coords(self.peak_indicator, peak_x, 0, peak_x, self.height)
-            self.itemconfig(self.peak_indicator, state=tk.NORMAL)
-        else:
-            self.itemconfig(self.peak_indicator, state=tk.HIDDEN)
-
-        self.peak *= decay_rate
-        self.after(50, self.update_vu)
-
-class StatusIndicator(tk.Canvas):
-    def __init__(self, master, width, height, initial_color, text, **kwargs):
-        tk.Canvas.__init__(self, master, width=width, height=height, bg=initial_color, **kwargs)
-        self.width = width
-        self.height = height
-        self.color = initial_color
-        self.text_id = self.create_text(width / 2, height / 2, text=text, anchor=tk.CENTER)
-
-    def set_color(self, color):
-        if self.color != color:
-            self.config(bg=color)
-            self.color = color
-
-    def set_text(self, text):
-        global last_status_text
-        if last_status_text != text:
-            self.itemconfig(self.text_id, text=text)
-            last_status_text = text
-
-def callback(indata, frames, time_info, status):
-    global vu_meter, input_status_indicator, last_volume_norm, last_callback_time, last_volume_log_time
-    try:
-        last_callback_time = time.time()
-        if status:
-            print(f"Audio input status: {status}")
-            if "overflow" in str(status).lower():
-                print("Input overflow detected. Scheduling stream restart.")
-                if root:
-                    root.after(0, schedule_stream_restart)
-                raise sd.CallbackAbort
-        if any(indata):
-            volume_norm = np.abs(indata).mean() * VOLUME_SCALE
-            # Log volume periodically if verbose debugging is enabled
-            if DEBUG_VERBOSE and time.time() - last_volume_log_time > 1.0:
-                print(f"Raw volume norm: {volume_norm:.3f}")
-                last_volume_log_time = time.time()
-            if abs(volume_norm - last_volume_norm) > update_threshold:
-                last_volume_norm = volume_norm
-                if root:
-                    root.after(0, lambda: vu_meter.set_level(volume_norm))
-            if volume_norm > audio_threshold:
-                if root:
-                    root.after(0, lambda: [input_status_indicator.set_color(has_input_color), input_status_indicator.set_text("Input: Yes")])
-            else:
-                if root:
-                    root.after(0, lambda: [input_status_indicator.set_color(no_input_color), input_status_indicator.set_text("Input: No")])
-        else:
-            if root:
-                root.after(0, lambda: vu_meter.set_level(0))
-                root.after(0, lambda: [input_status_indicator.set_color(no_input_color), input_status_indicator.set_text("Input: No")])
-            last_volume_norm = 0.0
-    except sd.CallbackAbort:
-        raise
-    except Exception as e:
-        print(f"Callback error: {e}")
-        if root:
-            root.after(0, schedule_stream_restart)
-
-def stop_audio_stream():
+# Start audio stream
+def start_audio_stream(device_id):
     global stream
     try:
-        if stream:
-            stream.abort()
-            stream.close()
-            print("Audio stream stopped.")
-        stream = None
-    except Exception as e:
-        print(f"Error stopping audio stream: {e}")
-    finally:
-        stream = None
-        try:
-            sd._terminate()
-            sd._initialize()
-            print("PortAudio refreshed.")
-        except Exception as e:
-            print(f"Error refreshing PortAudio: {e}")
-
-def start_audio_stream():
-    global stream, current_input_device, last_device_list
-    try:
-        time.sleep(DEVICE_REFRESH_DELAY)
-        devices = sd.query_devices()
-        input_devices = [d for d in devices if d['max_input_channels'] > 0]
-        possible_devices = [d for d in input_devices if d['index'] in target_device_indices and target_device_name.lower() in d['name'].lower()]
-
-        device_names = [d['name'] for d in input_devices]
-        if device_names != last_device_list:
-            print(f"Available input devices: {device_names}")
-            last_device_list = device_names
-
-        if possible_devices:
-            for device in possible_devices:
-                chosen_device_index = device['index']
-                current_input_device = device['name']
-                print(f"Attempting to start stream on {current_input_device} (index: {chosen_device_index}, hostapi: {device['hostapi']}, max_input_channels: {device['max_input_channels']})")
-                try:
-                    sd.check_input_settings(device=chosen_device_index, channels=channels, samplerate=samplerate)
-                    stream = sd.InputStream(
-                        device=chosen_device_index,
-                        channels=channels,
-                        samplerate=samplerate,
-                        blocksize=blocksize,
-                        callback=callback
-                    )
-                    stream.start()
-                    print(f"Audio stream started on device: {current_input_device} (index: {chosen_device_index})")
-                    if root:
-                        root.after(0, lambda: input_status_indicator.set_text(f"Device: {current_input_device[:10]}..."))
-                    return True
-                except sd.PortAudioError as e:
-                    print(f"Failed to start stream on {current_input_device} (index: {chosen_device_index}): {e}")
-                    continue
-            print(f"No valid devices found among {target_device_name} instances.")
-            if root:
-                root.after(0, lambda: input_status_indicator.set_text("No Device"))
-            return False
-        else:
-            print(f"No input devices found matching '{target_device_name}' at indices {target_device_indices}.")
-            if root:
-                root.after(0, lambda: input_status_indicator.set_text("No Device"))
-            return False
+        stop_audio_stream()
+        logging.info(f"Starting audio stream on device ID {device_id}")
+        stream = sd.InputStream(
+            device=device_id,
+            channels=1,
+            samplerate=44100,
+            callback=audio_callback
+        )
+        stream.start()
+        status_label.config(text="Mic Active", fg="green")
+        logging.info(f"Audio stream started on device ID {device_id}")
     except sd.PortAudioError as e:
-        print(f"PortAudio error starting audio stream: {e}")
-        if root:
-            root.after(0, lambda: input_status_indicator.set_text("Stream Error"))
-        return False
-    except Exception as e:
-        print(f"Unexpected error starting audio stream: {e}")
-        if root:
-            root.after(0, lambda: input_status_indicator.set_text("Stream Error"))
-        return False
-
-def schedule_stream_restart():
-    global is_restarting, retry_count
-    if is_restarting:
-        print("Restart already in progress. Skipping.")
-        return
-    is_restarting = True
-    try:
+        logging.error(f"PortAudioError: {e}")
+        status_label.config(text="Invalid Device", fg="red")
         stop_audio_stream()
-        time.sleep(DEVICE_REFRESH_DELAY)
-        devices = sd.query_devices()
-        input_devices = [d for d in devices if d['max_input_channels'] > 0]
-        possible_devices = [d for d in input_devices if d['index'] in target_device_indices and target_device_name.lower() in d['name'].lower()]
-        if not possible_devices:
-            if retry_count >= MAX_RETRIES:
-                print(f"Max retries ({MAX_RETRIES}) reached. Stopping retry attempts.")
-                if root:
-                    root.after(0, lambda: input_status_indicator.set_text("No Device"))
-                return
-            retry_delay = min(RETRY_INTERVAL_MS + (retry_count * 500), MAX_RETRY_BACKOFF_MS)
-            print(f"Target device '{target_device_name}' not found at indices {target_device_indices}. Retrying in {retry_delay}ms (attempt {retry_count + 1}/{MAX_RETRIES})...")
-            retry_count += 1
-            if root:
-                root.after(retry_delay, schedule_stream_restart)
-            return
-        retry_count = 0
-        if start_audio_stream() and stream and stream.active:
-            print("Stream restarted successfully.")
-        else:
-            print("Failed to restart stream. Retrying...")
-            if root:
-                root.after(RETRY_INTERVAL_MS, schedule_stream_restart)
     except Exception as e:
-        print(f"Error during stream restart: {e}")
-        if root:
-            root.after(RETRY_INTERVAL_MS, schedule_stream_restart)
-    finally:
-        is_restarting = False
+        logging.error(f"Error starting stream: {e}")
+        status_label.config(text="Error", fg="red")
+        stop_audio_stream()
 
-def check_audio_device():
-    global current_input_device, last_callback_time, last_device_list
+# Stop audio stream
+def stop_audio_stream():
+    global stream
+    if stream:
+        try:
+            logging.info("Stopping audio stream...")
+            stream.stop()
+            stream.close()
+            logging.info("Audio stream stopped")
+        except Exception as e:
+            logging.error(f"Error stopping stream: {e}")
+        finally:
+            stream = None
+            status_label.config(text="Mic Stopped", fg="gray")
+
+# Update device list with sorting
+def update_device_list():
+    global available_devices, selected_device_id
     try:
+        logging.info("Updating device list...")
         devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        hostapi_names = {i: api['name'] for i, api in enumerate(hostapis)}
+
+        # Filter devices with input channels
         input_devices = [d for d in devices if d['max_input_channels'] > 0]
-        possible_devices = [d for d in input_devices if d['index'] in target_device_indices and target_device_name.lower() in d['name'].lower()]
 
-        device_names = [d['name'] for d in input_devices]
-        if device_names != last_device_list:
-            print(f"Available input devices: {device_names}")
-            last_device_list = device_names
+        # Sort devices by relevance
+        keywords = ["USB", "Mic", "Microphone", "Headset"]
+        input_devices = sorted(
+            input_devices,
+            key=lambda d: any(kw.lower() in d['name'].lower() for kw in keywords),
+            reverse=True
+        )
+        available_devices = input_devices
 
-        if stream and stream.active and (time.time() - last_callback_time > STREAM_TIMEOUT_S):
-            print("Stream timed out. Restarting...")
-            schedule_stream_restart()
-            return
+        if input_devices:
+            device_names = [f"{d['name']} (ID: {d['index']}, Host: {hostapi_names[d['hostapi']]})" for d in input_devices]
+            device_dropdown['values'] = device_names
+            device_dropdown.config(state="readonly")
 
-        if not possible_devices:
-            if current_input_device:
-                print(f"Device '{current_input_device}' no longer available.")
-                stop_audio_stream()
-                current_input_device = None
-                if root:
-                    root.after(0, lambda: input_status_indicator.set_text("No Device"))
-            if root:
-                root.after(CHECK_DEVICE_INTERVAL_MS, check_audio_device)
-            return
+            if not selected_device_id or selected_device_id not in [d['index'] for d in input_devices]:
+                selected_device_id = input_devices[0]['index']
+                device_dropdown.current(0)
+                start_audio_stream(selected_device_id)
         else:
-            device_name = possible_devices[0]['name']
-            if device_name != current_input_device or not (stream and stream.active):
-                print(f"Input device changed to '{device_name}' or stream inactive. Restarting stream.")
-                stop_audio_stream()
-                current_input_device = device_name
-                if start_audio_stream():
-                    print("Stream restarted with new device.")
-                else:
-                    print("Failed to start stream with new device. Retrying...")
-                    if root:
-                        root.after(CHECK_DEVICE_INTERVAL_MS, check_audio_device)
-                return
-    except Exception as e:
-        print(f"Error checking audio device: {e}")
-        if root:
-            root.after(0, lambda: input_status_indicator.set_text("Device Error"))
-    if root:
-        root.after(CHECK_DEVICE_INTERVAL_MS, check_audio_device)
+            selected_device_id = None
+            stop_audio_stream()
+            device_dropdown['values'] = ["No Input Devices Found"]
+            device_dropdown.current(0)
+            device_dropdown.config(state="disabled")
+            status_label.config(text="No Mic Found", fg="red")
 
+        logging.info(f"Available devices: {[d['name'] for d in input_devices]}")
+    except Exception as e:
+        logging.error(f"Error updating device list: {e}")
+        status_label.config(text="Error", fg="red")
+
+# Handle device selection
+def on_device_select(event):
+    global selected_device_id
+    try:
+        selected_index = device_dropdown.current()
+        if selected_index != -1 and available_devices:
+            new_device_id = available_devices[selected_index]['index']
+            if new_device_id != selected_device_id:
+                selected_device_id = new_device_id
+                logging.info(f"Switching to device ID {new_device_id}")
+                start_audio_stream(selected_device_id)
+    except Exception as e:
+        logging.error(f"Error in device selection: {e}")
+        status_label.config(text="Bad Input", fg="red")
+
+# Update VU meter periodically
+def update_vu_meter():
+    try:
+        while not volume_queue.empty():
+            level = volume_queue.get()
+            vu_meter.set_level(level)
+    except Exception as e:
+        logging.error(f"Error updating VU meter: {e}")
+    root.after(100, update_vu_meter)
+
+# Main application
 def main():
-    global root, vu_meter, input_status_indicator
+    global root, vu_meter, status_label, device_dropdown
     try:
+        # Initialize window
         root = tk.Tk()
-        root.title("Microphone Monitor")
-        root.wm_attributes("-topmost", True)
-        root.resizable(True, True)
+        root.overrideredirect(True)
+        root.geometry("250x70")
+        root.configure(bg="lightgray")
+        root.resizable(False, False)
 
-        vu_meter = VUMeter(root, vu_width, vu_height, bg="black")
-        vu_meter.pack(padx=10, pady=5, fill=tk.X, expand=True)
+        # Dragging functionality
+        def start_drag(event):
+            root.x_offset = event.x
+            root.y_offset = event.y
 
-        input_status_indicator = StatusIndicator(root, status_width, status_height, "gray", "No Device")
-        input_status_indicator.pack(padx=10, pady=5, side=tk.LEFT)
+        def do_drag(event):
+            x = root.winfo_pointerx() - root.x_offset
+            y = root.winfo_pointery() - root.y_offset
+            root.geometry(f"+{x}+{y}")
 
-        vu_meter.update_vu()
+        # Header frame
+        header_frame = tk.Frame(root, bg="gray", height=20)
+        header_frame.pack(fill=tk.X)
+        header_frame.bind("<ButtonPress-1>", start_drag)
+        header_frame.bind("<B1-Motion>", do_drag)
 
-        if not start_audio_stream():
-            print("Initial stream start failed. Retrying...")
-            root.after(RETRY_INTERVAL_MS, schedule_stream_restart)
+        # Status label in header
+        status_label = tk.Label(header_frame, text="Initializing...", fg="black", bg="gray", font=("Arial", 8))
+        status_label.pack(side=tk.LEFT, padx=5)
 
-        root.after(CHECK_DEVICE_INTERVAL_MS, check_audio_device)
+        # Close button
+        close_button = tk.Button(
+            header_frame,
+            text="X",
+            font=("Arial", 8, "bold"),
+            bg="red",
+            fg="white",
+            bd=0,
+            command=root.destroy,
+            cursor="hand2"
+        )
+        close_button.pack(side=tk.RIGHT, padx=5)
+
+        # Device dropdown
+        device_dropdown = ttk.Combobox(root, state="readonly", width=30)
+        device_dropdown.pack(pady=2)
+        device_dropdown.bind("<<ComboboxSelected>>", on_device_select)
+
+        # VU meter with border
+        vu_frame = tk.Frame(root, bg="gray", bd=1, relief=tk.SUNKEN)
+        vu_frame.pack(pady=2)
+        vu_meter = VUMeter(vu_frame, width=230, height=15, bg="black")
+        vu_meter.pack()
+
+        # Initial setup
+        update_device_list()
+
+        # Periodic device check
+        def periodic_device_check():
+            update_device_list()
+            root.after(5000, periodic_device_check)
+
+        periodic_device_check()
+        root.after(100, update_vu_meter)
         root.mainloop()
-
-    except tk.TclError as e:
-        print(f"Tkinter error: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
         stop_audio_stream()
-        root = None
+    except Exception as e:
+        logging.error(f"Unhandled exception in main: {e}")
 
 if __name__ == "__main__":
     main()
